@@ -61,6 +61,9 @@ interface DownloadDao {
     @Query("SELECT * FROM downloads ORDER BY createdAt DESC")
     fun observeAll(): Flow<List<DownloadEntity>>
 
+    @Query("SELECT * FROM downloads")
+    suspend fun list(): List<DownloadEntity>
+
     @Query("SELECT * FROM downloads WHERE id = :id")
     suspend fun get(id: Long): DownloadEntity?
 

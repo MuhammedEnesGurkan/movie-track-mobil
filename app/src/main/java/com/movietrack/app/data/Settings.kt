@@ -80,6 +80,20 @@ class Settings(context: Context) {
         get() = p.getInt("seekStepSec", 10)
         set(v) { p.edit().putInt("seekStepSec", v).apply(); changed() }
 
+    /** Oynatıcıda ekranın sol / sağ yarısında dikey kaydırmanın işi: "brightness", "volume" ya da "none" */
+    var gestureLeft: String
+        get() = p.getString("gestureLeft", "brightness") ?: "brightness"
+        set(v) { p.edit().putString("gestureLeft", v).apply(); changed() }
+    var gestureRight: String
+        get() = p.getString("gestureRight", "volume") ?: "volume"
+        set(v) { p.edit().putString("gestureRight", v).apply(); changed() }
+
+    /** Oynatıcıda sonradan eklenen harici ses / altyazı dosyaları (videoya özel, satır başına bir adres) */
+    fun extAudio(key: String): List<String> = (p.getString("extAud:$key", "") ?: "").lines().filter { it.isNotBlank() }
+    fun saveExtAudio(key: String, uris: List<String>) { p.edit().putString("extAud:$key", uris.joinToString("\n")).apply() }
+    fun extSubs(key: String): List<String> = (p.getString("extSub:$key", "") ?: "").lines().filter { it.isNotBlank() }
+    fun saveExtSubs(key: String, uris: List<String>) { p.edit().putString("extSub:$key", uris.joinToString("\n")).apply() }
+
     /** Videoya özel altyazı gecikmesi (ms; artı: altyazı daha geç çıkar) */
     fun subOffset(key: String): Long = p.getLong("subOff:$key", 0)
     fun saveSubOffset(key: String, ms: Long) { p.edit().putLong("subOff:$key", ms).apply() }

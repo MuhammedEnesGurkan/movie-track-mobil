@@ -45,18 +45,22 @@ class StreamDownloader(private val app: App, private val ctx: JobContext) {
         // Yalnızca ses: ayrı ses izi varsa görüntü hiç indirilmez; yoksa ses ana akıştan ayıklanır
         val plans = if (audioOnly && allPlans.any { it.role == "audio" }) allPlans.filter { it.role == "audio" } else allPlans
         val tasks = plans.flatMapIndexed { si, p -> p.segments.mapIndexedNotNull { i, s -> if (skipAds && s.isAd) null else Triple(si, i, s) } }
-        ctx.segTotal = tasks.size
-        ctx.segDone = tasks.count { segFile(it.first, it.second).exists() }
-        e.downloadedBytes = tasks.sumOf { segFile(it.first, it.second).let { f -> if (f.exists()) f.length() else 0L } }
-        ctx.phase = "İndiriliyor"
-
         // Init segmentleri (fMP4): parçalar indikçe birleştirilebilsin diye önce alınır
         for ((si, p) in plans.withIndex()) for (m in p.segments.mapNotNull { it.map }.distinct()) {
             val f = initFile(si, m)
             if (!f.exists()) { val seg = p.segments.first { it.map == m }; f.writeBytes(Http.bytes(e, m, seg.mapRange)) }
         }
-        // İndirirken birleştirme: sıradaki parçalar indikçe akış dosyasına eklenir; indirme bitince bu adım beklenmez
+        // İndirirken birleştirme: sıradaki parçalar indikçe akış dosyasına eklenir ve parça dosyası silinir
+        // (yer tasarrufu); indirme bitince bu adım beklenmez. Kaldığı yer önce okunur: eklenmiş parçalar
+        // diskte yoktur ama indirilmiş sayılır.
         val joiners = plans.mapIndexed { si, p -> Joiner(si, p, skipAds) }
+        joiners.forEach { it.prepare() }
+        fun have(si: Int, i: Int) = joiners[si].isJoined(i) || segFile(si, i).exists()
+        ctx.segTotal = tasks.size
+        ctx.segDone = tasks.count { have(it.first, it.second) }
+        e.downloadedBytes = joiners.sumOf { it.file.length() } +
+            tasks.sumOf { (si, i) -> if (joiners[si].isJoined(i)) 0L else segFile(si, i).let { f -> if (f.exists()) f.length() else 0L } }
+        ctx.phase = "İndiriliyor"
 
         // 1) Segmentler (paralel). Sunucu "çok fazla istek" (429/503) derse durmaz: bağlantı sayısı yarıya
         // iner, beklenir, aynı parça yeniden denenir; bir süre sorunsuz gidince bağlantılar geri artar.
@@ -99,7 +103,7 @@ class StreamDownloader(private val app: App, private val ctx: JobContext) {
                         if (k >= tasks.size) break
                         val (si, i, seg) = tasks[k]
                         val f = segFile(si, i)
-                        if (f.exists()) continue
+                        if (have(si, i)) continue
                         var data = fetchSegment(seg)
                         data = if (plans[si].raw) data else Hls.stripJunk(decrypt(seg, data))
                         val tmp = File(f.path + ".part")
@@ -129,7 +133,7 @@ class StreamDownloader(private val app: App, private val ctx: JobContext) {
         val t0 = System.nanoTime()
         val early = joiners.sumOf { it.joined }
         val streamFiles = try {
-            joiners.map { j -> try { j.finish() } catch (x: java.io.IOException) { j.close(); concat(j.si, j.p, skipAds) } }
+            joiners.map { it.finish() }
         } finally { joiners.forEach { it.close() } }
         val concatMs = (System.nanoTime() - t0) / 1_000_000
         val streamBytes = streamFiles.sumOf { it.length() }
@@ -156,11 +160,16 @@ class StreamDownloader(private val app: App, private val ctx: JobContext) {
         // MP4 önce uygulamanın kendi klasörüne (doğrudan dosya sistemi) yazılır, sonra büyük bloklarla tek seferde
         // İndirilenler'e kopyalanır: MP4 yazıcısının çok sayıdaki küçük yazması bazı telefonlarda İndirilenler'in
         // ara katmanından (FUSE) geçince çok yavaşlıyor. Yer yetmezse doğrudan yazılır.
-        suspend fun runMux(out: OutputFile, ins: List<Muxer.Input>): Muxer.Result {
+        // Disk alanı: last=true ise (bu akış dosyalarıyla başka çıktı yapılmayacak) akış dosyaları kopyalamadan
+        // önce silinir; böylece aynı anda en fazla iki kopya durur (akış + MP4, sonra MP4 + son dosya).
+        var streamsDropped = false
+        fun freeBytes() = try { android.os.StatFs(dir.path).availableBytes } catch (_: Exception) { 0L }
+        suspend fun runMux(out: OutputFile, ins: List<Muxer.Input>, last: Boolean): Muxer.Result {
             val done = kotlinx.coroutines.CompletableDeferred<Muxer.Result>()
             val inBytes = ins.sumOf { File(it.path).length() }
-            val free = try { android.os.StatFs(dir.path).availableBytes } catch (_: Exception) { 0L }
-            val tmp = if (free > inBytes * 13 / 10) File(dir, "out-${System.nanoTime()}.tmp") else null
+            // Ara dosya yalnızca hem kendisine hem (akışlar silinmeyecekse) kopyasına yer varsa
+            val need = if (last) inBytes * 11 / 10 else inBytes * 22 / 10
+            val tmp = if (freeBytes() > need + (64L shl 20)) File(dir, "out-${System.nanoTime()}.tmp") else null
             val ms0 = System.nanoTime()
             kotlin.concurrent.thread(name = "birlestirme-${e.id}") {
                 try {
@@ -173,6 +182,22 @@ class StreamDownloader(private val app: App, private val ctx: JobContext) {
             val r = try { done.await() } catch (t: Throwable) { tmp?.delete(); throw t }
             val muxMs = (System.nanoTime() - ms0) / 1_000_000
             timings.append(", MP4 yazma ${speedOf(inBytes, muxMs)}${if (tmp == null) " (doğrudan, yer az)" else ""}")
+            // Ses eksikse akışlarla yeniden birleştirilecek: o zaman silinmez
+            if (last && !r.audioMissing) {
+                streamFiles.forEach { it.delete() }
+                streamsDropped = true
+            }
+            if (tmp != null && !streamsDropped && freeBytes() < tmp.length() + (32L shl 20)) {
+                // Kopyaya yer kalmadı: ara dosya bırakılır, doğrudan son dosyaya yeniden yazılır
+                tmp.delete()
+                val r2 = kotlinx.coroutines.CompletableDeferred<Muxer.Result>()
+                kotlin.concurrent.thread(name = "birlestirme-${e.id}") {
+                    try { r2.complete(out.openRw(app).use { Muxer.mux(ins, it.fileDescriptor, totalUs, active = { job?.isActive != false && !r2.isCancelled }) { f -> ctx.segDone = (f * 1000).toInt(); ctx.emit() } }) }
+                    catch (t: Throwable) { r2.completeExceptionally(t) }
+                }
+                timings.append(" (kopyaya yer kalmadı, doğrudan yeniden yazıldı)")
+                return r2.await()
+            }
             if (tmp != null) {
                 val c0 = System.nanoTime()
                 val prevPhase = ctx.phase
@@ -214,7 +239,7 @@ class StreamDownloader(private val app: App, private val ctx: JobContext) {
             val out = OutputStore.create(app, name, "audio/mp4", folder)
             try {
                 ctx.segTotal = 1000; ctx.segDone = 0
-                val r = runMux(out, inputs(allAudio = !hasSepAudio, video = false))
+                val r = runMux(out, inputs(allAudio = !hasSepAudio, video = false), last = true)
                 report.append("birleştirme (yalnız ses):\n").append(r.notes).append('\n')
                 out.publish(app)
                 e.outputUri = out.encode(); e.fileName = name; merged = true
@@ -230,13 +255,14 @@ class StreamDownloader(private val app: App, private val ctx: JobContext) {
             val out = OutputStore.create(app, name, "video/mp4", folder)
             try {
                 ctx.segTotal = 1000; ctx.segDone = 0
-                var r = runMux(out, inputs(allAudio = false, video = true))
+                val more = meta["alsoAudio"] == "1"
+                var r = runMux(out, inputs(allAudio = false, video = true), last = !more)
                 report.append("birleştirme:\n").append(r.notes).append('\n')
                 // Seçilen ayrı ses izi boş ya da eksik çıktıysa ana akışın kendi sesiyle yeniden birleştir
                 if (r.audioMissing && r.skippedAudio > 0) {
                     ctx.phase = "Ses yeniden ekleniyor"; ctx.segDone = 0; ctx.emit()
                     try { app.contentResolver.openFileDescriptor(out.uri, "rwt")?.close() } catch (_: Exception) {}
-                    r = runMux(out, inputs(allAudio = true, video = true)); usedAllAudio = true
+                    r = runMux(out, inputs(allAudio = true, video = true), last = !more); usedAllAudio = true
                     report.append("ses eksikti, ana akışın sesiyle yeniden:\n").append(r.notes).append('\n')
                     ctx.phase = "Birleştiriliyor"
                 }
@@ -257,12 +283,12 @@ class StreamDownloader(private val app: App, private val ctx: JobContext) {
                 report.append("birleştirme hatası: ${Errors.technical(t)}\n")
             }
             // İstenirse ses ayrıca .m4a olarak da (müzik çalarlar, arka planda dinleme için)
-            if (merged && meta["alsoAudio"] == "1") {
+            if (merged && meta["alsoAudio"] == "1" && !streamsDropped) {
                 ctx.phase = "Ses ayrıca kaydediliyor"; ctx.segDone = 0; ctx.emit()
                 val aname = "$base.${Lang.normalize(audioLang).ifEmpty { "ses" }}.m4a"
                 val aout = OutputStore.create(app, aname, "audio/mp4", folder)
                 try {
-                    val r = runMux(aout, inputs(allAudio = usedAllAudio, video = false))
+                    val r = runMux(aout, inputs(allAudio = usedAllAudio, video = false), last = true)
                     if (r.audioTracks > 0) { aout.publish(app); extras += "${aout.encode()}|${Lang.audLabel(audioLang)}" } else aout.delete(app)
                 } catch (t: Throwable) {
                     aout.delete(app)
@@ -273,11 +299,13 @@ class StreamDownloader(private val app: App, private val ctx: JobContext) {
         }
         if (!merged) {
             for ((si, p) in plans.withIndex()) {
-                val f = streamFiles[si].takeIf { it.exists() } ?: concat(si, p, skipAds)
+                // Birleştirme dosyası yazıldıktan sonra kaydedilemediyse akışlar silinmiş olabilir
+                val f = streamFiles[si].takeIf { it.exists() } ?: userError("Dosya kaydedilemedi: ${e.error ?: "birleştirme sonrası yazma hatası"}")
                 val ext = if (p.fmp4) (if (p.role == "audio") "m4a" else "mp4") else "ts"
                 val name = if (p.role == "audio") "$base.aud-${Lang.normalize(p.lang).ifEmpty { "und" }}.$ext" else "$base.$ext"
                 val out = OutputStore.create(app, name, if (ext == "ts") "video/mp2t" else if (ext == "m4a") "audio/mp4" else "video/mp4", folder)
                 copyTo(f, out)
+                f.delete() // sıradaki akışın kopyası için yer açılır
                 out.publish(app)
                 if (p.role == "main") { e.outputUri = out.encode(); e.fileName = name } else extras += "${out.encode()}|${Lang.audLabel(p.lang)}"
             }
@@ -402,8 +430,10 @@ class StreamDownloader(private val app: App, private val ctx: JobContext) {
     /**
      * İndirirken birleştirme: bir akışın parçaları sırayla indikçe akış dosyasının sonuna eklenir.
      * Durum (kaçıncı parçaya gelindiği ve dosya boyu) yanındaki .pos dosyasında tutulur; indirme
-     * duraklatılıp sürdürülünce kaldığı yerden devam eder. Tutarsızlıkta baştan kurulur.
-     * Parça dosyaları silinmez: sürdürme ve yedek birleştirme (concat) eskisi gibi çalışır.
+     * duraklatılıp sürdürülünce kaldığı yerden devam eder. Tutarsızlıkta baştan kurulur (silinmiş parçalar
+     * yeniden indirilir).
+     * Eklenen parça dosyası, durum kaydedildikten hemen sonra silinir: parçalar ve akış dosyası aynı anda
+     * diskte durmaz (eskiden indirme sonunda videonun iki kopyası birden duruyordu).
      */
     private inner class Joiner(val si: Int, val p: Plan, private val skipAds: Boolean) {
         val file = File(dir, "stream_$si.${if (p.fmp4) "mp4" else "ts"}")
@@ -411,7 +441,7 @@ class StreamDownloader(private val app: App, private val ctx: JobContext) {
         private val sig = "${p.segments.size}|$skipAds|${p.fmp4}"
         private val lock = java.util.concurrent.locks.ReentrantLock()
         private var os: FileOutputStream? = null
-        private var next = 0
+        @Volatile private var next = 0
         private var lastMap: String? = null
         private var failed = false
         /** İndirme sırasında eklenen parça sayısı (tanı raporu için) */
@@ -431,6 +461,15 @@ class StreamDownloader(private val app: App, private val ctx: JobContext) {
             os = FileOutputStream(file, true)
         }
 
+        /** Kaldığı yeri okur; indirme başlamadan çağrılır ki eklenmiş (silinmiş) parçalar yeniden indirilmesin. */
+        fun prepare() {
+            lock.lock()
+            try { open() } finally { lock.unlock() }
+        }
+
+        /** Bu parça akış dosyasına eklendi (dosyası silinmiş olabilir). */
+        fun isJoined(i: Int) = i < next
+
         private fun save() {
             os?.flush()
             val tmp = File(posFile.path + ".tmp")
@@ -443,6 +482,7 @@ class StreamDownloader(private val app: App, private val ctx: JobContext) {
             open()
             val out = os!!
             var wrote = false
+            val consumed = ArrayList<File>()
             while (next < p.segments.size && active()) {
                 val seg = p.segments[next]
                 if (!(skipAds && seg.isAd)) {
@@ -455,11 +495,15 @@ class StreamDownloader(private val app: App, private val ctx: JobContext) {
                         ins.copyTo(out, 1 shl 20)
                     }
                     wrote = true
+                    consumed += f
                     if (!all) joined++
                 }
                 next++
             }
             if (wrote || all) save()
+            // Durum kaydedildi: eklenen parçalar artık gereksiz. Kayıttan önce kapanırsa parça yerinde kalır ve
+            // sürdürmede yeniden eklenir (akış dosyası kayıtlı boyuta kısaltılır), veri kaybolmaz.
+            for (f in consumed) f.delete()
         }
 
         /** İndirme işçileri her parçadan sonra çağırır; başka bir işçi zaten ekliyorsa beklemeden döner. */
@@ -471,9 +515,12 @@ class StreamDownloader(private val app: App, private val ctx: JobContext) {
         /** İndirme bitince kalanları ekler ve akış dosyasını verir. */
         suspend fun finish(): File {
             val job = coroutineContext[kotlinx.coroutines.Job]
-            if (failed) throw java.io.IOException("joiner")
             lock.lock()
-            try { run(true) { job?.isActive != false } } finally { lock.unlock() }
+            try {
+                // İndirme sırasında yazma hatası olduysa: dosya kayıtlı son duruma döndürülüp kaldığı yerden sürdürülür
+                if (failed) { try { os?.close() } catch (_: Exception) {}; os = null; failed = false }
+                run(true) { job?.isActive != false }
+            } finally { lock.unlock() }
             coroutineContext.ensureActive()
             close()
             return file
@@ -483,26 +530,6 @@ class StreamDownloader(private val app: App, private val ctx: JobContext) {
             lock.lock()
             try { try { os?.close() } catch (_: Exception) {}; os = null } finally { lock.unlock() }
         }
-    }
-
-    private suspend fun concat(si: Int, p: Plan, skipAds: Boolean): File {
-        val out = File(dir, "stream_$si.${if (p.fmp4) "mp4" else "ts"}")
-        if (out.exists()) out.delete()
-        FileOutputStream(out).use { os ->
-            var lastMap: String? = null
-            for ((i, seg) in p.segments.withIndex()) {
-                coroutineContext.ensureActive()
-                if (skipAds && seg.isAd) continue
-                if (seg.map != null && seg.map != lastMap) { initFile(si, seg.map).let { if (it.exists()) os.write(it.readBytes()) }; lastMap = seg.map }
-                val f = segFile(si, i)
-                if (f.exists()) FileInputStream(f).use { ins ->
-                    // Ham ses parçaları (.aac/.mp3) başında ID3 etiketi taşır; ortadakiler okuyucuyu durdurur
-                    if (!p.fmp4) skipId3(ins, f.length())
-                    ins.copyTo(os, 1 shl 20)
-                }
-            }
-        }
-        return out
     }
 
     private fun speedOf(bytes: Long, ms: Long) = "%.1f sn (%.1f MB/sn)".format(java.util.Locale.US, ms / 1000.0, if (ms > 0) bytes / 1048576.0 / (ms / 1000.0) else 0.0)
