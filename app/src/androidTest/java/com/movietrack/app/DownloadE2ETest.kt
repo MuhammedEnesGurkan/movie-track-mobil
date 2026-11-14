@@ -228,6 +228,9 @@ class DownloadE2ETest {
         val pos = java.io.File(dir, "stream_0.pos")
         assertTrue("birleştirme durumu kaydedilmedi: ${dir.list()?.toList()}", pos.exists())
         android.util.Log.i("JoinTest", "duraklatıldı, durum: ${pos.readText().replace("\n", " | ")}")
+        // Akışa eklenen parça diskte tutulmaz (yer: parçalar + akış iki kopya olmasın); sırası gelmeyen bekler
+        assertFalse("eklenen parça silinmedi: ${dir.list()?.toList()}", java.io.File(dir, "0_0.seg").exists())
+        assertTrue("sırası gelmeyen parça silindi: ${dir.list()?.toList()}", java.io.File(dir, "0_2.seg").exists())
         app.downloads.resume(id).join()
         val deadline = System.currentTimeMillis() + 90_000
         var e = dao.get(id)!!

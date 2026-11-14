@@ -2,6 +2,7 @@ package com.movietrack.app.player
 
 import android.app.AlertDialog
 import android.app.PictureInPictureParams
+import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
@@ -23,6 +24,7 @@ import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.TextView
 import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.text.HtmlCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -31,10 +33,19 @@ import androidx.media3.common.C
 import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.Format
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.source.MergingMediaSource
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import androidx.media3.ui.SubtitleView
@@ -47,10 +58,11 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
- * Dahili oynatıcı (Media3/ExoPlayer): MP4/MKV/WebM/TS, harici altyazı (SRT/VTT/ASS), ses/altyazı izi
- * seçimi, hız, döngü, en-boy oranı, iki parmakla yakınlaştırma/kaydırma, altyazı zamanlaması,
- * ayarlanabilir sarma adımı, Resim içinde Resim, ekran kilidi, parlaklık/ses hareketleri,
- * kaldığın yerden devam.
+ * Dahili oynatıcı (Media3/ExoPlayer): MP4/MKV/WebM/TS, harici altyazı (SRT/VTT/ASS), harici ses dosyası
+ * (ayrı indirilen ya da sonradan seçilen ses videoya eklenir), ses/altyazı izi seçimi, hız, döngü,
+ * en-boy oranı, iki parmakla yakınlaştırma/kaydırma, altyazı zamanlaması, ayarlanabilir sarma adımı,
+ * Resim içinde Resim, ekran kilidi, parlaklık/ses hareketleri (hangi yarının neyi ayarlayacağı
+ * ayarlardan seçilir), kaldığın yerden devam.
  */
 @UnstableApi
 class PlayerActivity : ComponentActivity() {
@@ -70,11 +82,26 @@ class PlayerActivity : ComponentActivity() {
     private var pinching = false
 
     // Harici altyazılar uygulamada çizilir: böylece zamanlaması canlı kaydırılabilir
-    private class ExtSub(val lang: String, val cues: List<Subtitles.Cue>)
-    private var extSubs = listOf<ExtSub>()
+    private class ExtSub(val lang: String, val cues: List<Subtitles.Cue>, val name: String? = null)
+    private val extSubs = ArrayList<ExtSub>()
     private var extIdx = -1
     private var subOffsetMs = 0L
     private var shownCues: List<Subtitles.Cue>? = null
+
+    // Videoya ayrı dosyadan eklenen sesler: MergingMediaSource ile aynı zaman çizgisinde çalınır.
+    // Kaynak sırası: 0 = video, 1.. = extAudios. picked: kullanıcının oynatıcıdan seçtiği dosya.
+    private class ExtAudio(val uri: String, val name: String, val picked: Boolean)
+    private val extAudios = ArrayList<ExtAudio>()
+    // ExoPlayer'ın kendisinin çizdiği altyazılar (ASS/SSA vb. uygulamada okunamayanlar)
+    private val exoSubConfigs = ArrayList<MediaItem.SubtitleConfiguration>()
+    private var mainUri: Uri = Uri.EMPTY
+    /** İzler hazır olunca seçilecek harici ses kaynağı (1..), yoksa -1 */
+    private var pendingAudioSource = -1
+    /** Az önce eklenen dosya açılamazsa geri alınsın diye */
+    private var justAdded: (() -> Unit)? = null
+
+    private val pickAudio = registerForActivityResult(ActivityResultContracts.OpenDocument()) { onAudioPicked(it) }
+    private val pickSub = registerForActivityResult(ActivityResultContracts.OpenDocument()) { onSubPicked(it) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -119,39 +146,41 @@ class PlayerActivity : ComponentActivity() {
         setContentView(root)
         setupGestures()
 
+        mainUri = uri
         val subs = intent.getStringArrayListExtra("subs").orEmpty()
         val langs = intent.getStringArrayListExtra("subLangs").orEmpty()
         // SRT/VTT okunabiliyorsa uygulamada çizilir; okunamayanlar (ASS vb.) ExoPlayer'a bırakılır
-        val parsed = ArrayList<ExtSub>()
-        val rest = ArrayList<Int>()
-        subs.forEachIndexed { i, s ->
-            val cues = try {
-                val text = contentResolver.openInputStream(Uri.parse(s))?.use { it.readBytes().toString(Charsets.UTF_8) }?.removePrefix("﻿") ?: ""
-                if (text.contains("[Script Info]")) emptyList() else Subtitles.parseVtt(text).first.sortedBy { it.start }
-            } catch (_: Exception) { emptyList() }
-            if (cues.isNotEmpty()) parsed += ExtSub(langs.getOrNull(i) ?: "", cues) else rest += i
+        val rest = ArrayList<Pair<String, String?>>()
+        subs.forEachIndexed { i, s -> if (!addParsedSub(s, langs.getOrNull(i) ?: "")) rest += s to langs.getOrNull(i) }
+        // Daha önce bu video için oynatıcıdan eklenen altyazı dosyaları
+        settings.extSubs(resumeKey).filter { it !in subs && canRead(it) }.forEach { s ->
+            val name = fileName(Uri.parse(s))
+            if (!addParsedSub(s, langFromName(name), name)) rest += s to langFromName(name)
         }
-        extSubs = parsed
         val preferred = langs.firstOrNull()?.let { Lang.normalize(it) }?.takeIf { it.isNotEmpty() && it != "und" }
         if (extSubs.isNotEmpty()) extIdx = extSubs.indexOfFirst { Lang.normalize(it.lang) == preferred }.coerceAtLeast(0)
+        rest.forEachIndexed { i, (s, lang) -> exoSubConfigs += subConfig(s, lang, extIdx < 0 && i == 0) }
 
-        val subConfigs = rest.map { i ->
-            val s = subs[i]
-            val mime = when {
-                s.endsWith(".vtt", true) -> MimeTypes.TEXT_VTT
-                s.endsWith(".ass", true) || s.endsWith(".ssa", true) -> MimeTypes.TEXT_SSA
-                else -> MimeTypes.APPLICATION_SUBRIP
-            }
-            MediaItem.SubtitleConfiguration.Builder(Uri.parse(s)).setMimeType(mime).setLanguage(langs.getOrNull(i)).setLabel("subtitle:${Lang.normalize(langs.getOrNull(i)).ifEmpty { "und" }}")
-                .setSelectionFlags(if (extIdx < 0 && i == rest.first()) C.SELECTION_FLAG_DEFAULT else 0).build()
+        // Ayrı indirilen ses dosyaları ve daha önce oynatıcıdan eklenenler
+        val auds = intent.getStringArrayListExtra("audios").orEmpty()
+        val audLangs = intent.getStringArrayListExtra("audioLangs").orEmpty()
+        auds.forEachIndexed { i, a ->
+            val l = audLangs.getOrNull(i).orEmpty().takeIf { it.isNotBlank() && it != "und" }
+            extAudios += ExtAudio(a, if (l != null) "İndirilen ses (${Lang.displayName(l)})" else "İndirilen ses", picked = false)
         }
+        settings.extAudio(resumeKey).filter { u -> extAudios.none { it.uri == u } && canRead(u) }.forEach {
+            extAudios += ExtAudio(it, fileName(Uri.parse(it)), picked = true)
+        }
+        // Kullanıcı daha önce bir ses seçtiyse yine onunla başlasın
+        extAudios.indexOfLast { it.picked }.takeIf { it >= 0 }?.let { pendingAudioSource = it + 1 }
+
         player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().apply {
             // Uygulamanın çizdiği altyazı açıkken videodaki altyazı üst üste binmesin
             if (extIdx >= 0) setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
-            else if (subConfigs.isNotEmpty()) setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false).setPreferredTextLanguage(preferred).setSelectUndeterminedTextLanguage(true)
+            else if (exoSubConfigs.isNotEmpty()) setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false).setPreferredTextLanguage(preferred).setSelectUndeterminedTextLanguage(true)
         }.build()
         view.setShowSubtitleButton(extSubs.isEmpty())
-        player.setMediaItem(MediaItem.Builder().setUri(uri).setSubtitleConfigurations(subConfigs).build())
+        player.setMediaSource(buildSource())
         player.prepare()
         val pos = settings.resumePosition(resumeKey)
         if (pos > 5000) player.seekTo(pos)
@@ -159,6 +188,24 @@ class PlayerActivity : ComponentActivity() {
         player.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
                 if (state == Player.STATE_ENDED) settings.saveResumePosition(resumeKey, 0)
+                if (state == Player.STATE_READY) justAdded = null
+            }
+
+            override fun onTracksChanged(tracks: Tracks) {
+                val src = pendingAudioSource
+                if (src < 1) return
+                val g = tracks.groups.firstOrNull { it.type == C.TRACK_TYPE_AUDIO && sourceOf(it) == src } ?: return
+                pendingAudioSource = -1
+                selectAudio(g)
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                // Yeni eklenen dosya bozuksa onu çıkarıp videoya kaldığı yerden devam et
+                val undo = justAdded ?: return
+                justAdded = null
+                undo()
+                flash("Dosya açılamadı, kaldırıldı")
+                reload()
             }
         })
         overlay.post(subTick)
@@ -189,17 +236,72 @@ class PlayerActivity : ComponentActivity() {
     }
 
     private fun chooseSubtitle() {
-        val names = extSubs.map { s -> if (s.lang.isBlank()) "Altyazı" else Lang.displayName(s.lang) } + listOf("Videodaki altyazılar…", "Kapalı")
+        val names = extSubs.map { s -> s.name ?: if (s.lang.isBlank()) "Altyazı" else Lang.displayName(s.lang) } +
+            listOf("Videodaki altyazılar…", "Harici altyazı dosyası ekle…", "Kapalı")
         AlertDialog.Builder(this).setTitle("Altyazı")
             .setSingleChoiceItems(names.toTypedArray(), if (extIdx >= 0) extIdx else -1) { d, which ->
                 d.dismiss()
                 when {
                     which < extSubs.size -> { extIdx = which; textTracks(false) }
                     which == extSubs.size -> { extIdx = -1; textTracks(true); trackDialog(C.TRACK_TYPE_TEXT, "Altyazı") }
+                    which == extSubs.size + 1 -> pickSub.launch(arrayOf("*/*"))
                     else -> { extIdx = -1; textTracks(false) }
                 }
                 renderSubs()
             }.show()
+    }
+
+    /** SRT/VTT dosyasını okuyup uygulamanın çizdiği altyazılara ekler; okunamazsa false. */
+    private fun addParsedSub(uri: String, lang: String, name: String? = null): Boolean {
+        val cues = try {
+            val text = contentResolver.openInputStream(Uri.parse(uri))?.use { it.readBytes().toString(Charsets.UTF_8) }?.removePrefix("\uFEFF") ?: ""
+            if (text.contains("[Script Info]")) emptyList() else Subtitles.parseVtt(text).first.sortedBy { it.start }
+        } catch (_: Exception) { emptyList() }
+        if (cues.isEmpty()) return false
+        extSubs += ExtSub(lang, cues, name)
+        return true
+    }
+
+    private fun subConfig(uri: String, lang: String?, default: Boolean, name: String = uri): MediaItem.SubtitleConfiguration {
+        val mime = when {
+            name.endsWith(".vtt", true) -> MimeTypes.TEXT_VTT
+            name.endsWith(".ass", true) || name.endsWith(".ssa", true) -> MimeTypes.TEXT_SSA
+            name.endsWith(".ttml", true) || name.endsWith(".dfxp", true) -> MimeTypes.APPLICATION_TTML
+            else -> MimeTypes.APPLICATION_SUBRIP
+        }
+        return MediaItem.SubtitleConfiguration.Builder(Uri.parse(uri)).setMimeType(mime).setLanguage(lang)
+            .setLabel("subtitle:${Lang.normalize(lang).ifEmpty { "und" }}")
+            .setSelectionFlags(if (default) C.SELECTION_FLAG_DEFAULT else 0).build()
+    }
+
+    private fun onSubPicked(uri: Uri?) {
+        uri ?: return
+        keepAccess(uri)
+        val s = uri.toString()
+        val name = fileName(uri)
+        val lang = langFromName(name)
+        if (addParsedSub(s, lang, name)) {
+            extIdx = extSubs.size - 1
+            textTracks(false)
+            view.setShowSubtitleButton(false)
+            renderSubs()
+        } else if (Regex("\\.(ass|ssa|vtt|srt|ttml|dfxp)$", RegexOption.IGNORE_CASE).containsMatchIn(name)) {
+            // Uygulamanın okuyamadığı biçim (ASS gibi): ExoPlayer çizer, kaynak yeniden kurulur
+            val cfg = subConfig(s, lang.ifEmpty { null }, true, name)
+            for (k in exoSubConfigs.indices) exoSubConfigs[k] = exoSubConfigs[k].buildUpon().setSelectionFlags(0).build()
+            exoSubConfigs += cfg
+            extIdx = -1
+            renderSubs()
+            player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false).clearOverridesOfType(C.TRACK_TYPE_TEXT).build()
+            justAdded = { exoSubConfigs.remove(cfg); settings.saveExtSubs(resumeKey, settings.extSubs(resumeKey) - s) }
+            reload()
+        } else {
+            flash("Bu dosya altyazı olarak okunamadı")
+            return
+        }
+        settings.saveExtSubs(resumeKey, (settings.extSubs(resumeKey) + s).distinct())
+        flash("Altyazı eklendi: $name")
     }
 
     private fun textTracks(on: Boolean) {
@@ -301,10 +403,10 @@ class PlayerActivity : ComponentActivity() {
         SEEK_STEPS.forEach { sec ->
             step.add("$sec sn").setOnMenuItemClickListener { settings.seekStepSec = sec; flash("Sarma adımı: $sec sn"); true }
         }
-        pm.menu.add("Ses izi seç (aud:)").setOnMenuItemClickListener { trackDialog(C.TRACK_TYPE_AUDIO, "Ses izi"); true }
-        pm.menu.add("Altyazı seç (subtitle:)").setOnMenuItemClickListener {
-            if (extSubs.isNotEmpty()) chooseSubtitle() else trackDialog(C.TRACK_TYPE_TEXT, "Altyazı"); true
-        }
+        pm.menu.add("Ses izi seç (aud:)").setOnMenuItemClickListener { chooseAudio(); true }
+        pm.menu.add("Altyazı seç (subtitle:)").setOnMenuItemClickListener { chooseSubtitle(); true }
+        pm.menu.add("Harici ses dosyası ekle…").setOnMenuItemClickListener { launchAudioPicker(); true }
+        pm.menu.add("Harici altyazı dosyası ekle…").setOnMenuItemClickListener { pickSub.launch(arrayOf("*/*")); true }
         pm.menu.add("Altyazı zamanlaması").setOnMenuItemClickListener { openSync(); true }
         if (zoom != 1f) pm.menu.add("Yakınlaştırmayı sıfırla").setOnMenuItemClickListener { resetZoom(); true }
         pm.menu.add(if (player.repeatMode == Player.REPEAT_MODE_ONE) "Döngüyü kapat" else "Döngü").setOnMenuItemClickListener {
@@ -315,6 +417,144 @@ class PlayerActivity : ComponentActivity() {
 
     private fun trackDialog(type: Int, title: String) {
         TrackSelectionDialogBuilder(this, title, player, type).build().show()
+    }
+
+    // ------------------------------------------------------------------ harici ses
+
+    private fun buildSource(): MediaSource {
+        val item = MediaItem.Builder().setUri(mainUri).setSubtitleConfigurations(exoSubConfigs).build()
+        val main = DefaultMediaSourceFactory(this).createMediaSource(item)
+        if (extAudios.isEmpty()) return main
+        val factory = ProgressiveMediaSource.Factory(DefaultDataSource.Factory(this))
+        val audios: List<MediaSource> = extAudios.map { factory.createMediaSource(MediaItem.fromUri(it.uri)) }
+        // Zaman çizgisi videodan gelir; ses dosyası kısa/uzun olsa da video boyunca oynar
+        return MergingMediaSource(main, *audios.toTypedArray())
+    }
+
+    /** Kaynağı yeniden kurar (ses/altyazı eklenince); konum ve oynatma durumu korunur. */
+    private fun reload() {
+        val pos = player.currentPosition.coerceAtLeast(0)
+        val play = player.playWhenReady
+        player.setMediaSource(buildSource(), pos)
+        player.prepare()
+        player.playWhenReady = play
+    }
+
+    /** İzin MergingMediaSource'taki kaynak sırası (0: video, 1..: harici sesler). Kimlik "kaynak:iz" biçimindedir. */
+    private fun sourceOf(g: Tracks.Group): Int =
+        if (extAudios.isEmpty()) 0 else g.mediaTrackGroup.id.substringBefore(':').toIntOrNull() ?: 0
+
+    private fun selectAudio(g: Tracks.Group) {
+        if (!g.isTrackSupported(0)) { flash("Bu ses biçimi bu telefonda çalınamıyor"); return }
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+            .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, 0))
+            .build()
+    }
+
+    private fun audioName(g: Tracks.Group, i: Int): String {
+        val f = g.getTrackFormat(0)
+        val src = sourceOf(g)
+        val lang = f.language?.takeIf { it.isNotBlank() && it != "und" }?.let { Lang.displayName(it) }
+        val details = listOfNotNull(
+            f.label?.takeIf { it.isNotBlank() && !it.startsWith("aud:") } ?: lang,
+            codecName(f),
+            when (f.channelCount) { Format.NO_VALUE, 0 -> null; 1 -> "mono"; 2 -> "stereo"; 6 -> "5.1"; 8 -> "7.1"; else -> "${f.channelCount} kanal" },
+        )
+        val base = if (src >= 1) "Harici: ${extAudios.getOrNull(src - 1)?.name ?: "ses"}" else "Videodaki ses ${i + 1}"
+        return base + (if (details.isNotEmpty()) " · " + details.joinToString(" · ") else "") +
+            (if (!g.isTrackSupported(0)) " (çalınamaz)" else "")
+    }
+
+    private fun codecName(f: Format): String? = when (f.sampleMimeType) {
+        MimeTypes.AUDIO_AAC -> "AAC"
+        MimeTypes.AUDIO_AC3 -> "AC-3"
+        MimeTypes.AUDIO_E_AC3, MimeTypes.AUDIO_E_AC3_JOC -> "E-AC-3"
+        MimeTypes.AUDIO_DTS, MimeTypes.AUDIO_DTS_HD -> "DTS"
+        MimeTypes.AUDIO_OPUS -> "Opus"
+        MimeTypes.AUDIO_VORBIS -> "Vorbis"
+        MimeTypes.AUDIO_MPEG -> "MP3"
+        MimeTypes.AUDIO_FLAC -> "FLAC"
+        MimeTypes.AUDIO_TRUEHD -> "TrueHD"
+        null -> null
+        else -> f.sampleMimeType!!.substringAfter('/').uppercase(Locale.ROOT)
+    }
+
+    private fun chooseAudio() {
+        val groups = player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
+        val names = groups.mapIndexed { i, g -> audioName(g, i) }.toMutableList()
+        names += "Harici ses dosyası ekle…"
+        val picked = extAudios.any { it.picked }
+        if (picked) names += "Eklenen harici sesleri kaldır"
+        AlertDialog.Builder(this).setTitle("Ses")
+            .setSingleChoiceItems(names.toTypedArray(), groups.indexOfFirst { it.isSelected }) { d, which ->
+                d.dismiss()
+                when {
+                    which < groups.size -> selectAudio(groups[which])
+                    which == groups.size -> launchAudioPicker()
+                    else -> {
+                        extAudios.removeAll { it.picked }
+                        settings.saveExtAudio(resumeKey, emptyList())
+                        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().clearOverridesOfType(C.TRACK_TYPE_AUDIO).build()
+                        reload()
+                        flash("Harici sesler kaldırıldı")
+                    }
+                }
+            }.show()
+    }
+
+    private fun launchAudioPicker() {
+        // .m4a/.mka dosyaları bazı dosya yöneticilerinde video ya da bilinmeyen tür görünür
+        pickAudio.launch(arrayOf("audio/*", "video/*", "application/octet-stream"))
+    }
+
+    private fun onAudioPicked(uri: Uri?) {
+        uri ?: return
+        keepAccess(uri)
+        val s = uri.toString()
+        val idx = extAudios.indexOfFirst { it.uri == s }
+        if (idx >= 0) {
+            player.currentTracks.groups.firstOrNull { it.type == C.TRACK_TYPE_AUDIO && sourceOf(it) == idx + 1 }?.let { selectAudio(it) }
+            flash("Bu ses zaten ekli, ona geçildi")
+            return
+        }
+        val a = ExtAudio(s, fileName(uri), picked = true)
+        extAudios += a
+        settings.saveExtAudio(resumeKey, extAudios.filter { it.picked }.map { it.uri })
+        pendingAudioSource = extAudios.size
+        justAdded = {
+            extAudios.remove(a)
+            pendingAudioSource = -1
+            settings.saveExtAudio(resumeKey, extAudios.filter { it.picked }.map { it.uri })
+        }
+        reload()
+        flash("Ses eklendi: ${a.name}")
+    }
+
+    // ------------------------------------------------------------------ dosya yardımcıları
+
+    private fun keepAccess(uri: Uri) {
+        // Video bir dahaki açılışta da aynı dosyaları bulsun
+        try { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
+    }
+
+    private fun canRead(uri: String): Boolean = try {
+        contentResolver.openInputStream(Uri.parse(uri))?.use { true } ?: false
+    } catch (_: Exception) { false }
+
+    private fun fileName(uri: Uri): String {
+        try {
+            contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst()) c.getString(0)?.takeIf { it.isNotBlank() }?.let { return it }
+            }
+        } catch (_: Exception) {}
+        return uri.lastPathSegment?.substringAfterLast('/') ?: "dosya"
+    }
+
+    /** "Film.tr.srt" → "tr" (tanınan bir dil kodu yoksa boş) */
+    private fun langFromName(name: String): String {
+        val code = name.substringBeforeLast('.').substringAfterLast('.', "")
+        return if (code.length in 2..3 && Lang.displayName(code) != "Bilinmeyen dil") code else ""
     }
 
     // ------------------------------------------------------------------ hareketler
@@ -344,10 +584,22 @@ class PlayerActivity : ComponentActivity() {
 
     private var seekSum = 0L
     private var lastSeekAt = 0L
+    private var scrollMode = 0 // 0: henüz belli değil, 1: dikey (ses/parlaklık), -1: yoksay
+    private var startBright = 0.5f
+    private var startVol = 0f
+
+    private fun systemBrightness(): Float = try {
+        android.provider.Settings.System.getInt(contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS) / 255f
+    } catch (_: Exception) { 0.5f }
+
+    private fun bar(f: Float): String {
+        val n = (f.coerceIn(0f, 1f) * 10).roundToInt()
+        return "▮".repeat(n) + "▯".repeat(10 - n)
+    }
 
     /**
-     * Sol yarıda dikey kaydırma: parlaklık, sağ yarıda: ses. Çift dokunma: kenarlarda ayarlardaki adım kadar
-     * sarar (art arda dokundukça toplanır), ortada oynat/duraklat. İki parmak: büyüt/küçült ve sürükle.
+     * Dikey kaydırma: sol ve sağ yarının işi ayarlardan seçilir (varsayılan sol parlaklık, sağ ses).
+     * Çift dokunma: kenarlarda ayarlardaki adım kadar sarar (art arda dokundukça toplanır), ortada oynat/duraklat. İki parmak: büyüt/küçült ve sürükle.
      */
     private fun setupGestures() {
         val audio = getSystemService(AUDIO_SERVICE) as AudioManager
@@ -377,23 +629,41 @@ class PlayerActivity : ComponentActivity() {
             }
         })
         val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            // Değer parmağın toplam yolundan hesaplanır: küçük adımlar kaybolmaz, geri sürükleyince geri gelir
+            override fun onDown(e: MotionEvent): Boolean {
+                scrollMode = 0
+                val b = window.attributes.screenBrightness
+                startBright = if (b >= 0) b else systemBrightness()
+                startVol = audio.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat()
+                return false
+            }
+
             override fun onScroll(e1: MotionEvent?, e2: MotionEvent, dx: Float, dy: Float): Boolean {
-                if (locked || pinching || e1 == null || e2.pointerCount > 1 || abs(dy) < abs(dx)) return false
+                if (locked || pinching || e1 == null || e2.pointerCount > 1) return false
                 val h = view.height.toFloat().coerceAtLeast(1f)
-                if (e1.x < view.width / 2) {
-                    val lp = window.attributes
-                    val cur = if (lp.screenBrightness < 0) 0.5f else lp.screenBrightness
-                    lp.screenBrightness = (cur + dy / h).coerceIn(0.02f, 1f)
-                    window.attributes = lp
-                    flash("Parlaklık %${(lp.screenBrightness * 100).toInt()}")
-                } else {
-                    val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                    val step = (dy / h * max * 1.5f)
-                    if (abs(step) >= 1) {
-                        val v = (audio.getStreamVolume(AudioManager.STREAM_MUSIC) + step.toInt()).coerceIn(0, max)
-                        audio.setStreamVolume(AudioManager.STREAM_MUSIC, v, 0)
-                        flash("Ses $v/$max")
+                if (scrollMode == 0) {
+                    scrollMode = if (abs(e2.y - e1.y) > abs(e2.x - e1.x)) 1 else -1
+                    // Üst/alt kenardan sistem çubuğu çekilirken tetiklenmesin
+                    if (e1.y < h * 0.06f || e1.y > h * 0.94f) scrollMode = -1
+                }
+                if (scrollMode != 1) return false
+                val action = if (e1.x < view.width / 2) settings.gestureLeft else settings.gestureRight
+                // Ekran yüksekliğinin %80'i kadar kaydırma: en düşükten en yükseğe
+                val frac = (e1.y - e2.y) / (h * 0.8f)
+                when (action) {
+                    "brightness" -> {
+                        val lp = window.attributes
+                        lp.screenBrightness = (startBright + frac).coerceIn(0.01f, 1f)
+                        window.attributes = lp
+                        flash("☀ Parlaklık  ${bar(lp.screenBrightness)}  %${(lp.screenBrightness * 100).roundToInt()}")
                     }
+                    "volume" -> {
+                        val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                        val v = (startVol + frac * max).roundToInt().coerceIn(0, max)
+                        if (v != audio.getStreamVolume(AudioManager.STREAM_MUSIC)) audio.setStreamVolume(AudioManager.STREAM_MUSIC, v, 0)
+                        flash((if (v == 0) "🔇 Ses" else "🔊 Ses") + "  ${bar(v.toFloat() / max)}  $v/$max")
+                    }
+                    else -> return false
                 }
                 return true
             }
@@ -421,7 +691,8 @@ class PlayerActivity : ComponentActivity() {
             if (ev.pointerCount > 1 || sgd.isInProgress) pinching = true
             if (pinching) return@setOnTouchListener ev.actionMasked != MotionEvent.ACTION_UP
             gd.onTouchEvent(ev)
-            false
+            // Ses/parlaklık kaydırması bitince parmak kalkarken denetimler açılıp kapanmasın
+            scrollMode == 1 && ev.actionMasked != MotionEvent.ACTION_DOWN
         }
     }
 

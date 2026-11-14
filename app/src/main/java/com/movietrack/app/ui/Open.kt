@@ -29,6 +29,12 @@ object Open {
                 .putExtra("title", e.fileName)
                 .putExtra("subs", ArrayList(subs.map { it.first }))
                 .putExtra("subLangs", ArrayList(subs.map { it.second }))
+            // Ayrı indirilen ses dosyaları (aud:xx) oynatıcıda videoya eklenir
+            val auds = e.extraOutputs.lines().filter { it.contains("|aud:") }.mapNotNull { line ->
+                contentUri(ctx, line.substringBeforeLast('|'))?.toString()?.let { it to line.substringAfterLast('|').removePrefix("aud:") }
+            }
+            i.putExtra("audios", ArrayList(auds.map { it.first }))
+                .putExtra("audioLangs", ArrayList(auds.map { it.second }))
             ctx.startActivity(i)
             return
         }
