@@ -14,4 +14,3 @@ dependencyResolutionManagement {
 }
 rootProject.name = "MovieTrack"
 include(":app")
-include(":indirici")

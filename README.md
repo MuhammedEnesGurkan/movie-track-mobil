@@ -32,15 +32,15 @@ DRM korumalı içerikler (Widevine vb.) indirilemez.
 
 ## APK
 
-Her `mobil-android` gönderiminde GitHub Actions APK'yı derler: depo → **Actions → Android APK** → son çalıştırma →
-**Artifacts → MovieTrack-apk**. Zip'ten çıkan `app-debug.apk` telefona kurulur (bilinmeyen kaynaklara izin vererek).
+`main`'e her gönderimde GitHub Actions APK'yı derler ve **Releases → son-surum** altına `MovieTrack.apk` olarak koyar.
+Pull request'ler de derlenir ve testten geçer.
+
+Bu kod daha önce `movie-track-` reposunun `mobil-android` dalındaydı (`mobile/`); geçmişiyle birlikte buraya taşındı.
+indirici uygulaması artık kendi reposunda (`indirici-mobil`).
 
 ## Yerel derleme
 
-Android Studio ile `mobile/` klasörünü aç ya da:
-
 ```bash
-cd mobile
 ./gradlew assembleDebug        # APK: app/build/outputs/apk/debug/app-debug.apk
 ./gradlew testDebugUnitTest    # birim testleri
 ```

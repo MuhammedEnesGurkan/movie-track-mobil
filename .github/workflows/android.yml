@@ -1,0 +1,153 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Yeni gönderim gelince süren eski derlemeyi iptal et
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # APK: testleri beklemeden derlenir; main'e gönderimde Releases'e konur
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+      - name: APK derle
+        run: ./gradlew assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MovieTrack-apk
+          path: app/build/outputs/apk/debug/*.apk
+      # Telefondan tek dokunuşla indirme: Releases sayfasında hep en son APK
+      - name: Son sürümü yayınla
+        if: github.event_name != 'pull_request'
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk MovieTrack.apk
+          v=$(( ${{ github.run_number }} + 100 ))
+          gh release delete son-surum --yes --cleanup-tag || true
+          gh release create son-surum MovieTrack.apk --latest --target "$GITHUB_SHA" \
+            --title "Movie Track 0.1.$v (son test sürümü)" \
+            --notes "Otomatik derlendi: $(git log -1 --format=%s). Telefonda MovieTrack.apk'ya dokunup kurun."
+        env:
+          GH_TOKEN: ${{ github.token }}
+      # İndirme testleri için test APK'sı (yayından sonra; APK'yı geciktirmez)
+      - name: Test APK derle
+        run: ./gradlew assembleDebugAndroidTest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MovieTrack-test-apk
+          path: app/build/outputs/apk/androidTest/debug/*.apk
+
+  # Birim testleri APK ile paralel
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+      - name: Birim testleri
+        run: ./gradlew testDebugUnitTest
+
+  # Gerçek Android emülatöründe aç (çökme kontrolü) ve indirme testlerini çalıştır
+  smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: MovieTrack-apk
+      - uses: actions/download-artifact@v4
+        with:
+          name: MovieTrack-test-apk
+      - name: KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Emülatör önbelleği
+        uses: actions/cache@v4
+        id: avd
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-34-x86_64-google_apis
+      - name: Emülatör görüntüsü oluştur (ilk sefer)
+        if: steps.avd.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: false
+          script: echo "AVD hazır"
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: |
+            adb install -r app-debug.apk
+            adb shell pm grant com.movietrack.app android.permission.POST_NOTIFICATIONS || true
+            adb logcat -c
+            adb shell am start -W -n com.movietrack.app/.MainActivity
+            sleep 6
+            adb shell am start -W -a android.intent.action.VIEW -d https://example.com com.movietrack.app/.MainActivity
+            sleep 20
+            adb logcat -d -b crash > crash.txt || true
+            echo "=== CRASH ===" && cat crash.txt
+            # Yalnızca kendi uygulamamızın çökmesi sayılır (emülatördeki Gmail vb. bazen çöküyor)
+            ! grep -q "Process: com.movietrack.app," crash.txt
+            adb shell am force-stop com.movietrack.app
+            adb install -r app-debug-androidTest.apk
+            timeout 1500 adb shell am instrument -w -r -e class com.movietrack.app.DownloadE2ETest com.movietrack.app.test/androidx.test.runner.AndroidJUnitRunner > downloads.txt || true
+            grep -E "INSTRUMENTATION_STATUS: (test|stack)=|INSTRUMENTATION_STATUS_CODE: -2|INSTRUMENTATION_CODE|OK \(|FAILURES|Tests run" downloads.txt | head -150 || true
+            adb logcat -d -s AudioConvert:I DynSplit:I | tail -4 || true
+            adb logcat -c
+            timeout 900 adb shell am instrument -w -e class com.movietrack.app.MergeSpeedTest com.movietrack.app.test/androidx.test.runner.AndroidJUnitRunner > speed.txt || true
+            tail -5 speed.txt || true
+            adb logcat -d -s MergeSpeed:I | tail -5 || true
+            adb logcat -c
+            timeout 300 adb shell am instrument -w -e class com.movietrack.app.YouTubeLiveTest com.movietrack.app.test/androidx.test.runner.AndroidJUnitRunner > youtube.txt || true
+            tail -3 youtube.txt || true
+            adb logcat -d -s YouTubeLive:I | tail -6 || true
+            adb logcat -c
+            timeout 300 adb shell am instrument -w -r -e class com.movietrack.app.PlayerTest com.movietrack.app.test/androidx.test.runner.AndroidJUnitRunner > player.txt || true
+            grep -E "INSTRUMENTATION_STATUS: stack=|OK \(|FAILURES|Tests run" player.txt | head -30 || true
+            adb logcat -d -s PlayerTest:I | tail -4 || true
+            grep -q "^OK (" downloads.txt
+            grep -q "^OK (" player.txt
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: |
+            crash.txt
+            downloads.txt
+            player.txt

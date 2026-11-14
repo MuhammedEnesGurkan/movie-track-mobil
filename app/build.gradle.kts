@@ -13,7 +13,7 @@ android {
         applicationId = "com.movietrack.app"
         minSdk = 26
         targetSdk = 35
-        val run = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+        val run = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt() + 100 // eski repodaki 0.1.51'in üstünden devam (güncelleme olarak kurulabilsin)
         versionCode = run
         versionName = "0.1.$run"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
